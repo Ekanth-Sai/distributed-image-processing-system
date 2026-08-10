@@ -203,6 +203,32 @@ asserts. Turn it on with `PETABYTE_DIAG=1`.
 contention* (instrumented locks + goroutine dumps). It does **not** replace `go test -race`
 for *data* races — the two are complementary.
 
+**Active counterpart — the `-race` chaos harness.** `diag` is passive; a seeded scheduler
+chaos test (`internal/scheduler`, run under `-race`) is the active half. A pool of worker
+goroutines hammers one shard with the full op mix (poll, lease-renew with progress, report,
+idle-poll that triggers a steal) while faults are injected — transient failures that force
+retries, duplicate and late reports, and workers that die mid-task without reporting — then a
+deterministic drain finishes the rest. It asserts what must hold *however* the operations
+interleaved: **zero `diag` violations, ranges that tile the shard exactly (no gap, no overlap),
+every task terminal, and exactly one committed object per task.** Tracing (below) is on during
+the run, so a failure prints the causal chain that produced the offending work, and a coverage
+guard fails the test if a run never actually stole — a green result can't be a false comfort.
+
+### Causal event tracing (complete)
+
+`internal/trace` is an **opt-in** tracer for a unit of work's lifecycle *across the
+coordinator/worker boundary* — the thing that answers "why did this task run twice?". Its
+correlation handle is **derived from work identity, not propagated**: `TraceID(job, shard,
+range)` hashes the canonical triple, so the coordinator and the worker each compute the *same*
+id from fields the assignment already carries — **no proto change, no header plumbing**, the
+same attempt-independent identity behind `FinalResultKey`/`SideEffectKey`. The scheduler emits
+`assigned`, `chunk_granted`, `stolen` (with the victim's bumped generation as the causal
+parent), `retry`, `failed`, and `committed`; the worker emits `worker_recv` and `staged`; the
+sandbox exposes it to algorithm code as `PETABYTE_TRACE_ID` next to `PETABYTE_IDEMPOTENCY_KEY`.
+`GET /debug/trace` serves the ring with `?task=`, `?trace=`, and `?causal=1` (groups events by
+`TraceID` and surfaces the steal/retry lineage). Off by default: one atomic load per would-be
+emit. Turn it on with `PETABYTE_TRACE=1`.
+
 ### Backpressure & admission control (complete)
 
 Submitting a thousand jobs schedules a quarter-million tasks at once — the scheduler's
